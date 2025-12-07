@@ -1,0 +1,445 @@
+---
+title: "Predictive Models"
+author: "Joshua Curtin"
+date: "2025-11-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Libraries
+```{r}
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(Matrix)
+library(pROC)
+library(rpart)
+library(rpart.plot)
+library(ranger)
+library(nnet)
+```
+## Load and prep data
+```{r}
+set.seed(42)
+
+# Load in dataset from exploratory stage
+df <- read.csv("readmissions_data.csv", stringsAsFactors = FALSE)
+
+df$readmit_30d <- if (is.numeric(df$readmit_30d) || is.integer(df$readmit_30d)) {
+  factor(ifelse(df$readmit_30d == 1, "Yes", "No"), levels = c("Yes","No"))
+} else {
+  factor(ifelse(df$readmit_30d %in% c("1","Yes","yes","TRUE","True"), "Yes", "No"),
+         levels = c("Yes","No"))
+}
+
+# Drop columns that aren't needed (can leave these in if you are running on a better computer, but mine keeps shutting down the script due to limited RAM)
+drop_cols <- c(
+  "admittime",
+  "dischtime",
+  "deathtime",
+  "language",
+  "hospital_expire_flag",
+  "prescription_list",
+  "mean_height",
+  "mean_weight",
+  "mean_bmi",
+  "next_admit"
+)
+df <- df %>% dplyr::select(-any_of(drop_cols))
+
+# Dataset is too large and takes too long or crashes the memory, reducing the size
+set.seed(42)
+
+df <- df %>% 
+  group_by(readmit_30d) %>% 
+  sample_frac(size = 30000 / nrow(df)) %>%
+  ungroup()
+
+# Make training and testing data sets
+idx  <- createDataPartition(df$readmit_30d, p = 0.70, list = FALSE)
+train <- df[idx, ]
+test  <- df[-idx, ]
+train$readmit_30d <- factor(train$readmit_30d, levels = c("Yes","No"))
+test$readmit_30d  <- factor(test$readmit_30d,  levels = c("Yes","No"))
+
+# Everything except if they are readmitted
+form <- readmit_30d ~ .
+```
+```{r}
+# Match up the matrix for training and testing
+align_to_train <- function(X_train, X_test_raw) {
+  train_cols <- colnames(X_train)
+  missing_in_test <- setdiff(train_cols, colnames(X_test_raw))
+  if (length(missing_in_test) > 0) {
+    add_zero <- Matrix(0, nrow = nrow(X_test_raw), ncol = length(missing_in_test), sparse = TRUE)
+    colnames(add_zero) <- missing_in_test
+    X_test_raw <- cbind(X_test_raw, add_zero)
+  }
+  extra_in_test <- setdiff(colnames(X_test_raw), train_cols)
+  if (length(extra_in_test) > 0) {
+    X_test_raw <- X_test_raw[, setdiff(colnames(X_test_raw), extra_in_test), drop = FALSE]
+  }
+  X_test_raw[, train_cols, drop = FALSE]
+}
+
+# Check performance with AUC + confusion matrix with a generic 0.5 threshold
+eval_probs <- function(probs, truth, positive = "Yes") {
+  pred <- factor(ifelse(probs >= 0.5, positive, setdiff(levels(truth), positive)[1]),
+                 levels = levels(truth))
+  auc  <- as.numeric(pROC::roc(response = truth, predictor = probs,
+                               levels = c("No","Yes"), quiet = TRUE)$auc)
+  cm   <- caret::confusionMatrix(pred, truth, positive = positive)
+  list(AUC = auc, CM = cm, Probs = probs, Pred = pred)
+}
+```
+## Train Models
+```{r}
+# Build sparse matrices once
+X_train <- sparse.model.matrix(form, data = train)[, -1, drop = FALSE]
+y_train <- ifelse(train$readmit_30d == "Yes", 1, 0)
+X_test_raw <- sparse.model.matrix(form, data = test)[, -1, drop = FALSE]
+X_test <- align_to_train(X_train, X_test_raw)
+
+# Logistic Regression
+lambda_ridge <- exp(seq(log(1e-3), log(5e-1), length.out = 12))
+fit_glm_ridge <- cv.glmnet(
+  x = X_train, y = y_train,
+  family = "binomial",
+  alpha = 0,
+  lambda = lambda_ridge,
+  nfolds = 3,
+  type.measure = "auc"
+)
+p_glm <- as.numeric(predict(fit_glm_ridge, newx = X_test, s = "lambda.min", type = "response"))
+res_glm <- eval_probs(p_glm, test$readmit_30d)
+
+# LASSO
+lambda_lasso <- exp(seq(log(1e-3), log(5e-1), length.out = 12))
+fit_lasso_cv <- cv.glmnet(
+  x = X_train, y = y_train,
+  family = "binomial",
+  alpha = 1,
+  lambda = lambda_lasso,
+  nfolds = 3,
+  type.measure = "auc"
+)
+p_lasso <- as.numeric(predict(fit_lasso_cv, newx = X_test, s = "lambda.min", type = "response"))
+res_lasso <- eval_probs(p_lasso, test$readmit_30d)
+
+# Elastic Net (alpha in {0.25, 0.5, 0.75}; pick best AUC)
+alphas <- c(0.25, 0.5, 0.75)
+lambda_enet <- exp(seq(log(1e-3), log(5e-1), length.out = 10))
+enet_fits <- lapply(alphas, function(a) {
+  cv.glmnet(x = X_train, y = y_train, family = "binomial",
+            alpha = a, lambda = lambda_enet, nfolds = 3, type.measure = "auc")
+})
+# choose alpha by max cv AUC
+cv_aucs <- sapply(enet_fits, function(m) max(m$cvm))
+best_idx <- which.max(cv_aucs)
+fit_enet_cv <- enet_fits[[best_idx]]
+best_alpha  <- alphas[best_idx]
+
+p_enet <- as.numeric(predict(fit_enet_cv, newx = X_test, s = "lambda.min", type = "response"))
+res_enet <- eval_probs(p_enet, test$readmit_30d)
+
+#### =========================================================
+#### caret Models: Decision Tree, Random Forest, Neural Net
+#### =========================================================
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,                    # keep light; raise to 5 for final
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  verboseIter = FALSE
+)
+metric <- "ROC"
+
+# Decision Tree
+set.seed(42)
+tree_grid <- expand.grid(cp = seq(0.000, 0.02, by = 0.004))
+fit_tree <- train(
+  form, data = train,
+  method = "rpart",
+  tuneGrid = tree_grid,
+  metric = metric,
+  trControl = ctrl
+)
+p_tree <- predict(fit_tree, newdata = test, type = "prob")[, "Yes"]
+res_tree <- eval_probs(p_tree, test$readmit_30d)
+
+# Random Forest
+set.seed(42)
+p <- ncol(train) - 1
+rf_grid <- expand.grid(
+  mtry = pmax(1, floor(c(0.1, 0.2, 0.3) * p)),
+  splitrule = c("gini","extratrees"),
+  min.node.size = c(5, 10)
+)
+fit_rf <- train(
+  form, data = train,
+  method = "ranger",
+  tuneGrid = rf_grid,
+  metric = metric,
+  trControl = ctrl,
+  num.trees = 400,
+  importance = "impurity"
+)
+p_rf <- predict(fit_rf, newdata = test, type = "prob")[, "Yes"]
+res_rf <- eval_probs(p_rf, test$readmit_30d)
+
+# Neural Network
+set.seed(42)
+nnet_grid <- expand.grid(
+  size = c(3, 5, 7),
+  decay = c(0.0001, 0.001, 0.01)
+)
+fit_nnet <- train(
+  form, data = train,
+  method = "nnet",
+  tuneGrid = nnet_grid,
+  metric = metric,
+  trControl = ctrl,
+  trace = FALSE,
+  maxit = 200
+)
+p_nnet <- predict(fit_nnet, newdata = test, type = "prob")[, "Yes"]
+res_nnet <- eval_probs(p_nnet, test$readmit_30d)
+```
+## Compare Models
+```{r}
+compare_tbl <- tibble::tibble(
+  Model = c(
+    "Logistic Regression",
+    "LASSO",
+    "Elastic Net",
+    "Decision Tree",
+    "Random Forest",
+    "Neural Net"
+  ),
+  AUC = c(res_glm$AUC, res_lasso$AUC, res_enet$AUC,
+          res_tree$AUC, res_rf$AUC, res_nnet$AUC),
+  Accuracy = c(
+    res_glm$CM$overall["Accuracy"],
+    res_lasso$CM$overall["Accuracy"],
+    res_enet$CM$overall["Accuracy"],
+    res_tree$CM$overall["Accuracy"],
+    res_rf$CM$overall["Accuracy"],
+    res_nnet$CM$overall["Accuracy"]
+  ) %>% as.numeric()
+) %>% arrange(desc(AUC))
+
+print(compare_tbl)
+```
+## Find optimal thresholds for each of the above models
+```{r}
+find_best_threshold <- function(probs, truth) {
+  roc_obj <- pROC::roc(truth, probs, levels = c("No","Yes"), quiet=TRUE)
+  best_coords <- pROC::coords(roc_obj, x = "best", best.method = "youden",
+                               ret = c("threshold", "sensitivity", "specificity"))
+  return(best_coords)
+}
+
+best_glm   <- find_best_threshold(res_glm$Probs,   test$readmit_30d)
+best_lasso <- find_best_threshold(res_lasso$Probs, test$readmit_30d)
+best_enet  <- find_best_threshold(res_enet$Probs,  test$readmit_30d)
+best_tree  <- find_best_threshold(res_tree$Probs,  test$readmit_30d)
+best_rf    <- find_best_threshold(res_rf$Probs,    test$readmit_30d)
+best_nnet  <- find_best_threshold(res_nnet$Probs,  test$readmit_30d)
+```
+```{r}
+library(dplyr)
+
+# coords() output to a data.frame with required columns + add Model
+best_to_df <- function(x, model_name) {
+  df <- as.data.frame(x)
+  # Ensure expected column names exist
+  needed <- c("threshold", "sensitivity", "specificity")
+  if (!all(needed %in% names(df))) {
+    stop("Expected columns missing in best_* object: ", model_name)
+  }
+  df %>%
+    mutate(Model = model_name) %>%
+    select(Model, threshold, sensitivity, specificity)
+}
+
+# need a combined table
+threshold_tbl <- bind_rows(
+  best_to_df(best_glm,   "Logistic Ridge"),
+  best_to_df(best_lasso, "LASSO"),
+  best_to_df(best_enet,  "Elastic Net"),
+  best_to_df(best_tree,  "Decision Tree"),
+  best_to_df(best_rf,    "Random Forest"),
+  best_to_df(best_nnet,  "Neural Net")   # <- can have multiple rows (ties)
+) %>%
+  mutate(BalancedAccuracy = (sensitivity + specificity) / 2)
+
+print(threshold_tbl)
+```
+-- Okay so neural net is actually useless, it is saying if we classify everyone as yes or no we get a 50 50 shot. Like yeah no duh. Do I even include that?
+
+## Use new thresholds with models
+```{r}
+# Lock truth vector
+truth <- factor(as.vector(test$readmit_30d), levels = c("Yes","No"))
+
+# threshold application
+apply_threshold <- function(probs, truth, best_obj) {
+  # best_obj from pROC::coords 
+  thr <- as.numeric(best_obj[,"threshold", drop = TRUE])
+
+
+  probs <- as.vector(probs)
+  keep <- stats::complete.cases(probs, truth)
+  probs <- probs[keep]
+  truth <- truth[keep]
+
+  pred <- factor(ifelse(probs >= thr, "Yes", "No"), levels = c("Yes","No"))
+  cm   <- caret::confusionMatrix(pred, truth, positive = "Yes")
+  list(Threshold = thr,
+       Sensitivity = unname(cm$byClass["Sensitivity"]),
+       Specificity = unname(cm$byClass["Specificity"]),
+       Accuracy = unname(cm$overall["Accuracy"]),
+       BalancedAccuracy = unname(cm$byClass["Balanced Accuracy"]),
+       CM = cm)
+}
+
+# apply probabilities
+opt_glm   <- apply_threshold(res_glm$Probs,   truth, best_glm)
+opt_lasso <- apply_threshold(res_lasso$Probs, truth, best_lasso)
+opt_enet  <- apply_threshold(res_enet$Probs,  truth, best_enet)
+opt_tree  <- apply_threshold(res_tree$Probs,  truth, best_tree)
+opt_rf    <- apply_threshold(res_rf$Probs,    truth, best_rf)
+#opt_nnet  <- apply_threshold(res_nnet$Probs,  truth, best_nnet)
+
+# comparison table
+opt_tbl <- tibble::tibble(
+  Model = c("Logistic Ridge", "LASSO", "Elastic Net", "Decision Tree", "Random Forest"),
+  Threshold = c(opt_glm$Threshold, opt_lasso$Threshold, opt_enet$Threshold, opt_tree$Threshold, opt_rf$Threshold),
+  Sensitivity = c(opt_glm$Sensitivity, opt_lasso$Sensitivity, opt_enet$Sensitivity, opt_tree$Sensitivity, opt_rf$Sensitivity),
+  Specificity = c(opt_glm$Specificity, opt_lasso$Specificity, opt_enet$Specificity, opt_tree$Specificity, opt_rf$Specificity),
+  BalancedAccuracy = c(opt_glm$BalancedAccuracy, opt_lasso$BalancedAccuracy, opt_enet$BalancedAccuracy, opt_tree$BalancedAccuracy, opt_rf$BalancedAccuracy)
+)
+
+print(opt_tbl)
+```
+-- Balanced Accuracy:
+No is way more common than yes, so balanced accuracy is (Sensitivity + Specificity) / 2
+
+Sensitivity (Recall/TPR):
+Of all true readmissions, how many did the model correctly identify?
+
+Specificity (TNR):
+Of all true non-readmissions, how many did the model correctly identify?
+
+## ROC curve for models
+```{r}
+library(pROC)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# truth vector
+truth <- factor(test$readmit_30d, levels = c("No","Yes"))
+
+# ROC objects for each model
+roc_glm   <- roc(truth, res_glm$Probs,   levels = c("No","Yes"), quiet = TRUE)
+roc_lasso <- roc(truth, res_lasso$Probs, levels = c("No","Yes"), quiet = TRUE)
+roc_enet  <- roc(truth, res_enet$Probs,  levels = c("No","Yes"), quiet = TRUE)
+roc_tree  <- roc(truth, res_tree$Probs,  levels = c("No","Yes"), quiet = TRUE)
+roc_rf    <- roc(truth, res_rf$Probs,    levels = c("No","Yes"), quiet = TRUE)
+#roc_nnet  <- roc(truth, res_nnet$Probs,  levels = c("No","Yes"), quiet = TRUE)
+
+# ROC curves to data frame for ggplot2
+roc_df <- bind_rows(
+  data.frame(Model = "Logistic Ridge",   tpr = roc_glm$sensitivities,   fpr = 1 - roc_glm$specificities),
+  data.frame(Model = "LASSO",            tpr = roc_lasso$sensitivities, fpr = 1 - roc_lasso$specificities),
+  data.frame(Model = "Elastic Net",      tpr = roc_enet$sensitivities,  fpr = 1 - roc_enet$specificities),
+  data.frame(Model = "Decision Tree",    tpr = roc_tree$sensitivities,  fpr = 1 - roc_tree$specificities),
+  data.frame(Model = "Random Forest",    tpr = roc_rf$sensitivities,    fpr = 1 - roc_rf$specificities),
+  #data.frame(Model = "Neural Net",       tpr = roc_nnet$sensitivities,  fpr = 1 - roc_nnet$specificities)
+)
+
+# plot ROC curves
+ggplot(roc_df, aes(x = fpr, y = tpr, color = Model)) +
+  geom_line(size = 1.1) +
+  geom_abline(linetype = "dashed", color = "gray40") +
+  labs(
+    title = "ROC Curves for All Models",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+Across all modeling approaches, the Random Forest emerged as the strongest overall predictor of 30-day readmission. Using the optimal threshold derived from Youden’s J, the Random Forest achieved the highest balanced accuracy (0.6604) by effectively combining strong specificity (0.6981) with good sensitivity (0.6227). This indicates that the model not only identifies high-risk patients with reasonable accuracy but also minimizes false alarms. Among the linear models, LASSO produced the best sensitivity (0.7271805), making it particularly valuable for clinical risk-flagging scenarios where missing a potential readmission is more costly than generating additional alerts. Logistic Ridge and Elastic Net performed nearly identically, demonstrating that the readmission signal is predominantly linear and moderately strong across many predictors. The Decision Tree model provided weaker discrimination but retains value for interpretability and simple rule extraction. The Neural Network (nnet) failed to learn meaningful structure, likely due to dataset size, feature sparsity, and high-cardinality categorical variables.
+#Random Forest is the recommended final predictive model
+# LASSO serves as the preferred interpretable model for understanding key drivers of readmission risk
+
+## What is in LASSO
+```{r}
+# pull coefficients at lambda.min
+coef_lasso <- coef(fit_lasso_cv, s = "lambda.min")
+
+# make a usable table
+coef_df <- data.frame(
+  Feature = coef_lasso@Dimnames[[1]],
+  Coefficient = as.numeric(coef_lasso)
+) %>% 
+  dplyr::filter(Coefficient != 0) %>% 
+  dplyr::arrange(desc(abs(Coefficient)))   # rank by strength
+
+print(coef_df)
+```
+The LASSO model identifies several meaningful predictors of 30-day readmission. Discharge destination is especially influential: patients sent to psychiatric facilities, acute hospitals (standard short term care), or those leaving against medical advice have substantially higher readmission risk, while discharge to hospice or documented death strongly reduces it. Admission characteristics also matter—elective, direct emergency, and emergency room admissions show elevated risk, and missing or atypical admission location information is among the strongest predictors of return. Demographic factors such as male gender, single marital status, and Black/African American race show modest increases in risk, while “race unknown” appears inversely associated, likely reflecting documentation artifacts rather than true protection. A higher number of medication routes administered shows a mild protective effect. Overall, LASSO emphasizes transitions of care, admission pathways, and certain demographic factors as the primary drivers of readmission.
+
+```{r, fig.height=14, fig.width=10}
+library(dplyr)
+library(ggplot2)
+
+# coef_df table with Feature + Coefficient
+coef_lasso <- coef(fit_lasso_cv, s = "lambda.min")
+
+coef_df <- data.frame(
+  Feature = coef_lasso@Dimnames[[1]],
+  Coefficient = as.numeric(coef_lasso)
+) %>%
+  filter(Coefficient != 0,
+         Feature != "(Intercept)") %>%
+  arrange(desc(abs(Coefficient)))
+
+# Plot
+ggplot(coef_df, aes(x = reorder(Feature, Coefficient),
+                    y = Coefficient,
+                    fill = Coefficient > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("steelblue", "firebrick"),
+                    labels = c("Decreases Risk", "Increases Risk")) +
+  labs(
+    title = "Key Drivers of 30-Day Readmission (LASSO Model)",
+    x = "Feature",
+    y = "LASSO Coefficient (Effect Size)",
+    fill = "Effect Direction"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+```{r}
+# probabilities to class predictions at 0.5 cutoff
+pred_glm_class <- factor(
+  ifelse(p_glm >= 0.5, "Yes", "No"),
+  levels = c("Yes", "No")
+)
+
+# confusion matrix
+cm_glm <- confusionMatrix(pred_glm_class, test$readmit_30d, positive = "Yes")
+
+cm_glm
+```
+

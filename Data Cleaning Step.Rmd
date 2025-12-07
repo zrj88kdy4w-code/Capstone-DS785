@@ -1,0 +1,165 @@
+---
+title: "Data Exploration"
+author: "Joshua Curtin"
+date: "2025-10-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+```{r, echo=FALSE}
+library(data.table)
+library(dplyr)
+library(readr)
+library(rstudioapi)
+library(parallel)
+library(tidyr)
+```
+## Easy to read in tables
+```{r}
+patients   <- fread("patients.csv", nThread = detectCores() - 1)
+admissions <- fread("admissions.csv", nThread = detectCores() - 1)
+transfers  <- fread("transfers.csv", nThread = detectCores() - 1)
+services   <- fread("services.csv", nThread = detectCores() - 1)
+provider   <- fread("provider.csv", nThread = detectCores() - 1)
+diagnoses_icd  <- fread("diagnoses_icd.csv", nThread = detectCores() - 1)
+procedures_icd <- fread("procedures_icd.csv", nThread = detectCores() - 1)
+icustays   <- fread("icustays.csv", nThread = detectCores() - 1)
+omr        <- fread("omr.csv", nThread = detectCores() - 1)
+micro      <- fread("microbiologyevents.csv", nThread = detectCores() - 1)
+```
+## These ones take forever so run alone
+
+## Lab Events file, read in data, create smaller csv file, and only read that. (Sorry, the first time you run this it will take a long time)
+```{r}
+if (file.exists("lab_summary.csv")) {
+  lab_summary <- fread("lab_summary.csv")
+} else {
+  lab_summary <- fread("labevents.csv",
+                       select = c("hadm_id", "flag"),
+                       nThread = detectCores() - 1)[,
+    .(num_lab_tests = .N,
+      num_abnormal = sum(flag %in% c("abnormal", "high", "low"), na.rm = TRUE)),
+    by = hadm_id]
+  fwrite(lab_summary, "lab_summary.csv")
+}
+```
+## Prescriptions file, same as above
+```{r}
+if (file.exists("presc_summary.csv")) {
+  presc_summary <- fread("presc_summary.csv")
+} else {
+  
+  presc_summary <- fread("prescriptions.csv",
+                         select = c("hadm_id", "drug", "route"),
+                         nThread = detectCores() - 1)[, .(
+    num_rx_ordered   = uniqueN(drug),
+    num_routes_used  = uniqueN(route),
+    prescription_list = paste(unique(na.omit(drug)), collapse = ", ")
+  ), by = hadm_id]
+  
+  fwrite(presc_summary, "presc_summary.csv")
+}
+```
+## Medication in emergency room, same as above
+```{r}
+if (file.exists("emar_summary.csv")) {
+  emar_summary <- fread("emar_summary.csv")
+} else {
+  emar_detail <- fread("emar_detail.csv",
+                       select = c("subject_id", "emar_id",
+                                  "product_description", "route"),
+                       nThread = detectCores() - 1)
+
+  emar_summary <- emar_detail[, .(
+    num_meds_administered  = uniqueN(product_description),
+    num_routes_administered = uniqueN(route),
+    num_emar_events         = uniqueN(emar_id)
+  ), by = subject_id]
+
+  fwrite(emar_summary, "emar_summary.csv")
+  rm(emar_detail); gc()
+}
+```
+## Condense tables down to visits on each patient
+```{r}
+# easier to make summaries
+diagnosis_summary <- diagnoses_icd[, .(num_diagnoses = uniqueN(icd_code)), by = hadm_id]
+procedure_summary <- procedures_icd[, .(num_procedures = uniqueN(icd_code)), by = hadm_id]
+service_summary   <- services[, .(num_service_transfers = uniqueN(curr_service)), by = hadm_id]
+icu_flag          <- icustays[, .(had_icu_stay = 1), by = hadm_id]
+
+## omr has tricky naming conventions, instead of columns it has result_value and lists them out there
+omr_summary <- omr[, .(
+  mean_weight_lbs = mean(as.numeric(result_value[result_name == "Weight (Lbs)"]), na.rm = TRUE),
+  mean_height_in  = mean(as.numeric(result_value[result_name == "Height (Inches)"]), na.rm = TRUE),
+  mean_bmi        = mean(as.numeric(result_value[result_name == "BMI (kg/m2)"]), na.rm = TRUE)
+), by = subject_id]
+
+# Replace NaN with NA
+omr_summary[is.nan(mean_weight_lbs), mean_weight_lbs := NA]
+omr_summary[is.nan(mean_height_in),  mean_height_in  := NA]
+omr_summary[is.nan(mean_bmi),        mean_bmi        := NA]
+
+## micro summary
+micro_summary <- micro[, .(
+  num_cultures             = .N,
+  num_positive_cultures    = sum(!is.na(org_name) & org_name != "", na.rm = TRUE),
+  num_organisms_identified = uniqueN(org_name),
+  num_antibiotics_tested   = uniqueN(ab_name)
+), by = hadm_id]
+```
+## Create dataset for modeling
+```{r}
+patients <- patients[, .(subject_id, gender, anchor_age, anchor_year, anchor_year_group)]
+admissions <- admissions[, .(subject_id, hadm_id, admittime, dischtime, deathtime,
+                             admission_type, admission_location, discharge_location,
+                             insurance, language, marital_status, race, hospital_expire_flag)]
+
+# join patients on admissions
+core_data <- merge(admissions, patients, by = "subject_id", all.x = TRUE)
+
+# join all summaries
+core_data <- core_data %>%
+  left_join(diagnosis_summary, by = "hadm_id") %>%
+  left_join(procedure_summary, by = "hadm_id") %>%
+  left_join(lab_summary, by = "hadm_id") %>%
+  left_join(presc_summary, by = "hadm_id") %>%
+  left_join(service_summary, by = "hadm_id") %>%
+  left_join(micro_summary, by = "hadm_id") %>%
+  left_join(icu_flag, by = "hadm_id") %>%
+  left_join(omr_summary, by = "subject_id") %>%
+  left_join(emar_summary, by = "subject_id")
+
+# Fill missing values with 0
+core_data <- core_data %>%
+  mutate(across(where(is.numeric), ~replace_na(., 0)))
+```
+## Get rid of rows where height or weight are 0
+```{r}
+core_data <- core_data %>%
+  filter(mean_height_in > 0, mean_weight_lbs > 0)
+```
+## Identify patients who were readmitted within 30 days
+```{r}
+core_data <- core_data %>%
+  arrange(subject_id, admittime) %>%
+  group_by(subject_id) %>%
+  mutate(
+    next_admit = lead(admittime),
+    readmit_30d = ifelse(
+      !is.na(next_admit) &
+      as.numeric(difftime(next_admit, dischtime, units = "days")) <= 30, 1, 0)
+  ) %>%
+  ungroup()
+```
+## Save data as csv to use for modeling (I am going to use a different R markdown so I don't have a huge mess in this one)
+```{r}
+fwrite(core_data, "readmissions_data.csv")
+```
+
+
+

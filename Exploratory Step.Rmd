@@ -1,0 +1,206 @@
+---
+title: "Exploratory Data Analysis"
+author: "Joshua Curtin"
+date: "2025-10-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(parallel)
+library(scales)
+```
+## Read in data
+```{r}
+readmin_data   <- fread("readmissions_data.csv", nThread = detectCores() - 1)
+```
+## Count of individual patients and admissions
+```{r}
+# count unique patients and admissions
+readmin_data %>%
+  summarize(
+    total_patients       = n_distinct(subject_id),
+    total_admissions     = n_distinct(hadm_id),
+    total_readmissions   = sum(readmit_30d, na.rm = TRUE),
+    readmission_rate     = mean(readmit_30d, na.rm = TRUE)
+  )
+```
+## Readmission distribution
+```{r}
+ggplot(readmin_data, aes(x = factor(readmit_30d))) +
+  geom_bar(fill = "#4E79A7") +
+  labs(
+    title = "Distribution of 30-Day Readmissions",
+    x = "Readmitted (1 = Yes, 0 = No)",
+    y = "Count",
+    fill = "Readmitted"
+  ) +
+  theme_minimal()
+```
+## Age and readmission
+```{r}
+ggplot(readmin_data, aes(x = anchor_age, fill = factor(readmit_30d))) +
+  geom_histogram(position = "dodge", bins = 30) +
+  labs(title = "Age Distribution by Readmission Status",
+       x = "Age", y = "Count", fill = "Readmitted") +
+  theme_minimal()
+```
+## Group requested I break this down by percentage instead of count
+```{r}
+ggplot(
+  readmin_data %>%
+    mutate(age_group = cut(anchor_age, breaks = seq(0, 100, by = 10))) %>%
+    count(age_group, readmit_30d) %>%
+    group_by(age_group) %>%
+    mutate(pct = n / sum(n) * 100),
+  aes(x = age_group, y = pct, fill = factor(readmit_30d))
+) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = sprintf("%.1f%%", pct)),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 3.2
+  ) +
+  scale_fill_manual(
+    values = c("#1f77b4", "#ff7f0e"),
+    labels = c("No", "Yes")
+  ) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    labels = percent_format(scale = 1)
+  ) +
+  labs(
+    title = "Readmission Rate by Age Group",
+    x = "Age Group (Years)",
+    y = "Percent of Patients",
+    fill = "Readmitted"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+
+## Feature Correlation
+```{r}
+numeric_vars <- readmin_data %>%
+  select(where(is.numeric)) %>%
+  select(-subject_id, -hadm_id)
+
+cor_matrix <- cor(numeric_vars, use = "pairwise.complete.obs")
+
+# heatmap
+library(reshape2)
+melted_cor <- melt(cor_matrix)
+ggplot(melted_cor, aes(x=Var1, y=Var2, fill=value)) +
+  geom_tile() +
+  scale_fill_gradient2(low="red", high="blue", mid="white", midpoint=0) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Correlation Heatmap of Numeric Variables")
+```
+## How long each stay is
+```{r}
+# length_of_stay (in days)
+readmin_data <- readmin_data %>%
+  mutate(length_of_stay = as.numeric(difftime(dischtime, admittime, units = "days")))
+```
+
+```{r}
+# compare means between readmitted vs non-readmitted for continuous variables
+t.test(length_of_stay ~ readmit_30d, data = readmin_data)
+t.test(num_lab_tests ~ readmit_30d, data = readmin_data)
+
+# categorical variables (e.g., gender, insurance)
+table(readmin_data$gender, readmin_data$readmit_30d)
+chisq.test(table(readmin_data$gender, readmin_data$readmit_30d))
+
+
+table(readmin_data$insurance, readmin_data$readmit_30d)
+chisq.test(table(readmin_data$insurance, readmin_data$readmit_30d))
+```
+Length of stay: P value of 2.2^-16 would make the difference between the two groups sigificant. Those that aren't readmitted are there for 4.5 days, and those that are readmitted stay for 5.6
+  - 1.1 days longer for people that are readmitted since that seems significant I am going to once again save my file
+  
+Number of lab tests ordered: Readmitted patients had about 60 more tests ordered during their stay, p-vlaue says it is significant
+
+Impact of gender: seems men are more likely to be readmitted
+```{r}
+fwrite(readmin_data, "readmissions_data.csv")
+```
+  
+```{r}
+ggplot(readmin_data, aes(x = factor(readmit_30d),
+                         y = length_of_stay,
+                         fill = factor(readmit_30d))) +
+  geom_boxplot(alpha = 0.85, outlier.shape = 21, outlier.size = 1.5, outlier.fill = "gray90") +
+  stat_summary(fun = median, geom = "text",
+               aes(label = round(..y.., 1)),
+               vjust = -0.5, color = "black", size = 3) +
+  scale_fill_manual(
+    values = c("0" = "#4E79A7", "1" = "#E15759"),
+    labels = c("0" = "Not Readmitted", "1" = "Readmitted"),
+    name = "Readmission Status"
+  ) +
+  coord_cartesian(ylim = c(0, 20)) +  # Focus on most of the distribution
+  labs(
+    title = "Length of Stay by 30-Day Readmission Status",
+    subtitle = "Readmitted patients have longer median stays (p < 0.001)",
+    x = "Readmission Status",
+    y = "Length of Stay (Days)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 11, color = "gray30"),
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+```
+  Median values shown here, showing that people who stay longer are more likely to be readmitted
+
+## PCA section for presentation
+```{r}
+library(FactoMineR)
+library(ggplot2)
+library(factoextra)
+
+# pick numeric predictors
+num_data <- readmin_data %>%
+  select(where(is.numeric)) %>%
+  select(-subject_id, -hadm_id, -readmit_30d)
+
+# perform PCA
+pca_model <- PCA(num_data, scale.unit = TRUE, graph = FALSE)
+
+is_ggplot <- function(x) inherits(x, "ggplot")
+
+# Scree plot
+fviz_eig(pca_model, addlabels = TRUE, ylim = c(0, 60))
+
+# Biplot
+fviz_pca_biplot(pca_model,
+                habillage = factor(readmin_data$readmit_30d),
+                col.var = "black",
+                palette = c("#4E79A7", "#E15759"),
+                title = "PCA Biplot by Readmission Status")
+
+```
+```{r}
+summary(pca_model)           # variance explained
+head(pca_model$rotation)     # loadings for each PC
+```
+
